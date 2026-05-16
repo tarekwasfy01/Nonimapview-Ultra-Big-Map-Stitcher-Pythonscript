@@ -7,8 +7,8 @@ import tifffile
 
 # =========================================================
 # PROFESSIONAL VERSION
-# BigTIFF + Row-based + Low RAM Usage
-# Safe for very large image sets
+# Save each row separately first
+# Then merge rows into ONE final BigTIFF
 # =========================================================
 
 # Required once:
@@ -43,7 +43,7 @@ if not base_name:
     print("No base filename entered. Program terminated.")
     exit()
 
-# Final output name
+# Final TIFF filename
 final_name = simpledialog.askstring(
     "Final TIFF File",
     "Enter final TIFF filename (without .tiff)"
@@ -53,6 +53,10 @@ if not final_name:
     final_name = "FINAL_BIGTIFF"
 
 final_output = os.path.join(folder, f"{final_name}.tiff")
+
+# Folder for saved row images
+rows_folder = os.path.join(folder, "rows_temp")
+os.makedirs(rows_folder, exist_ok=True)
 
 # =========================================================
 # Regex for files like:
@@ -90,7 +94,7 @@ if not tiles:
 
 print("\n======================================")
 print(f"Found tiles: {len(tiles)}")
-print(f"Grid size: {max_x + 1} x {max_y + 1}")
+print(f"Grid size: {max_x} x {max_y}")
 print("======================================\n")
 
 # =========================================================
@@ -107,65 +111,122 @@ first_path = os.path.join(folder, tiles[first_key])
 with Image.open(first_path) as first_img:
     tile_w, tile_h = first_img.size
 
-full_width = (max_x + 1) * tile_w
-full_height = (max_y + 1) * tile_h
+full_width = max_x * tile_w
+full_height = max_y * tile_h
 
 print(f"Tile size: {tile_w} x {tile_h}")
 print(f"Final image size: {full_width} x {full_height}")
 print()
 
 # =========================================================
-# BigTIFF Writer
-# Row-by-row writing
-# Very low RAM usage
+# STEP 1
+# Create and save each row separately
 # =========================================================
 
-print("Creating BigTIFF...")
-print("This may take a while for large projects.\n")
+print("STEP 1: Creating row images...\n")
 
-with tifffile.TiffWriter(final_output, bigtiff=True) as tif:
+for y in range(max_y):
+    print(f"Creating row {y + 1} / {max_y}")
 
-    for y in range(max_y + 1):
-        print(f"Processing row {y + 1} / {max_y + 1}")
+    row_array = np.zeros(
+        (tile_h, full_width, 3),
+        dtype=np.uint8
+    )
 
-        # One row only in memory
-        row_array = np.zeros(
-            (tile_h, full_width, 3),
-            dtype=np.uint8
-        )
+    for x in range(max_x):
+        key = (x, y)
 
-        for x in range(max_x + 1):
-            key = (x, y)
+        if key not in tiles:
+            print(f"Missing tile: x={x}, y={y}")
+            continue
 
-            if key not in tiles:
-                print(f"Missing tile: x={x}, y={y}")
-                continue
+        img_path = os.path.join(folder, tiles[key])
 
-            img_path = os.path.join(folder, tiles[key])
+        try:
+            with Image.open(img_path) as img:
+                img = img.convert("RGB")
+                img_np = np.array(img)
 
-            try:
-                with Image.open(img_path) as img:
-                    img = img.convert("RGB")
-                    img_np = np.array(img)
+                h, w, _ = img_np.shape
 
-                    start_x = x * tile_w
-                    end_x = start_x + tile_w
+                paste_h = min(tile_h, h)
+                paste_w = min(tile_w, w)
 
-                    row_array[:, start_x:end_x, :] = img_np
+                start_x = x * tile_w
 
-            except Exception as e:
-                print(f"Error loading: {img_path}")
-                print(e)
+                row_array[
+                    0:paste_h,
+                    start_x:start_x + paste_w,
+                    :
+                ] = img_np[
+                    0:paste_h,
+                    0:paste_w,
+                    :
+                ]
 
-        # Append row as TIFF page
-        tif.write(
-            row_array,
-            compression="deflate",
-            photometric="rgb"
-        )
+        except Exception as e:
+            print(f"Error loading: {img_path}")
+            print(e)
+
+    row_path = os.path.join(
+        rows_folder,
+        f"row_{y:04d}.tiff"
+    )
+
+    tifffile.imwrite(
+        row_path,
+        row_array,
+        compression="deflate"
+    )
+
+print("\nAll row images saved.\n")
+
+# =========================================================
+# STEP 2
+# Merge saved rows into ONE final BigTIFF
+# =========================================================
+
+print("STEP 2: Creating final BigTIFF...\n")
+
+final_memmap = tifffile.memmap(
+    final_output,
+    shape=(full_height, full_width, 3),
+    dtype=np.uint8,
+    bigtiff=True
+)
+
+for y in range(max_y):
+    print(f"Inserting row {y + 1} / {max_y}")
+
+    row_path = os.path.join(
+        rows_folder,
+        f"row_{y:04d}.tiff"
+    )
+
+    if not os.path.exists(row_path):
+        print(f"Missing row file: {row_path}")
+        continue
+
+    try:
+        row_data = tifffile.imread(row_path)
+
+        start_y = y * tile_h
+        end_y = start_y + tile_h
+
+        final_memmap[
+            start_y:end_y,
+            :,
+            :
+        ] = row_data
+
+    except Exception as e:
+        print(f"Error loading row: {row_path}")
+        print(e)
+
+final_memmap.flush()
 
 print("\n======================================")
 print("DONE")
-print("BigTIFF saved at:")
+print("Final BigTIFF saved at:")
 print(final_output)
 print("======================================")
